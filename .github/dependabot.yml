@@ -10,23 +10,30 @@ updates:
     groups:
       dependencies:
         dependency-type: production
-        exclude-patterns:
-          - 'puppeteer*'
-          - 'chrome-devtools-frontend'
         patterns:
           - '*'
       dev-dependencies:
         dependency-type: development
         exclude-patterns:
           - 'puppeteer*'
+          - 'chrome-devtools-frontend'
+          - '@modelcontextprotocol/sdk'
+          - 'yargs'
+          - 'debug'
+          - 'core-js'
         patterns:
           - '*'
-      puppeteer:
-        patterns:
-          - 'puppeteer*'
-      chrome-devtools-frontend:
+      # breaks often so better to roll separetely.
+      bundled-devtools:
         patterns:
           - 'chrome-devtools-frontend'
+      bundled:
+        patterns:
+          - 'puppeteer*'
+          - '@modelcontextprotocol/sdk'
+          - 'yargs'
+          - 'debug'
+          - 'core-js'
   - package-ecosystem: github-actions
     directory: /
     schedule:

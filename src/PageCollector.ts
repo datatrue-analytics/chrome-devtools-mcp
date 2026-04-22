@@ -4,14 +4,38 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import {FakeIssuesManager} from './DevtoolsUtils.js';
+import {logger} from './logger.js';
+import type {
+  Target,
+  CDPSession,
+  ConsoleMessage,
+  Protocol,
+} from './third_party/index.js';
+import {DevTools} from './third_party/index.js';
 import {
   type Browser,
   type Frame,
   type Handler,
   type HTTPRequest,
   type Page,
-  type PageEvents,
-} from 'puppeteer-core';
+  type PageEvents as PuppeteerPageEvents,
+} from './third_party/index.js';
+
+export class UncaughtError {
+  readonly details: Protocol.Runtime.ExceptionDetails;
+  readonly targetId: string;
+
+  constructor(details: Protocol.Runtime.ExceptionDetails, targetId: string) {
+    this.details = details;
+    this.targetId = targetId;
+  }
+}
+
+interface PageEvents extends PuppeteerPageEvents {
+  issue: DevTools.AggregatedIssue;
+  uncaughtError: UncaughtError;
+}
 
 export type ListenerMap<EventMap extends PageEvents = PageEvents> = {
   [K in keyof EventMap]?: (event: EventMap[K]) => void;
@@ -38,7 +62,7 @@ export class PageCollector<T> {
     collector: (item: T) => void,
   ) => ListenerMap<PageEvents>;
   #listeners = new WeakMap<Page, ListenerMap>();
-  #maxNavigationSaved = 3;
+  protected maxNavigationSaved = 3;
 
   /**
    * This maps a Page to a list of navigations with a sub-list
@@ -55,27 +79,43 @@ export class PageCollector<T> {
     this.#listenersInitializer = listeners;
   }
 
-  async init() {
-    const pages = await this.#browser.pages();
+  async init(pages: Page[]) {
     for (const page of pages) {
-      this.#initializePage(page);
+      this.addPage(page);
     }
 
-    this.#browser.on('targetcreated', async target => {
-      const page = await target.page();
-      if (!page) {
-        return;
-      }
-      this.#initializePage(page);
-    });
-    this.#browser.on('targetdestroyed', async target => {
-      const page = await target.page();
-      if (!page) {
-        return;
-      }
-      this.#cleanupPageDestroyed(page);
-    });
+    this.#browser.on('targetcreated', this.#onTargetCreated);
+    this.#browser.on('targetdestroyed', this.#onTargetDestroyed);
   }
+
+  dispose() {
+    this.#browser.off('targetcreated', this.#onTargetCreated);
+    this.#browser.off('targetdestroyed', this.#onTargetDestroyed);
+  }
+
+  #onTargetCreated = async (target: Target) => {
+    try {
+      const page = await target.page();
+      if (!page) {
+        return;
+      }
+      this.addPage(page);
+    } catch (err) {
+      logger('Error getting a page for a target onTargetCreated', err);
+    }
+  };
+
+  #onTargetDestroyed = async (target: Target) => {
+    try {
+      const page = await target.page();
+      if (!page) {
+        return;
+      }
+      this.cleanupPageDestroyed(page);
+    } catch (err) {
+      logger('Error getting a page for a target onTargetDestroyed', err);
+    }
+  };
 
   public addPage(page: Page) {
     this.#initializePage(page);
@@ -85,7 +125,6 @@ export class PageCollector<T> {
     if (this.storage.has(page)) {
       return;
     }
-
     const idGenerator = createIdGenerator();
     const storedLists: Array<Array<WithSymbolId<T>>> = [[]];
     this.storage.set(page, storedLists);
@@ -120,10 +159,10 @@ export class PageCollector<T> {
     }
     // Add the latest navigation first
     navigations.unshift([]);
-    navigations.splice(this.#maxNavigationSaved);
+    navigations.splice(this.maxNavigationSaved);
   }
 
-  #cleanupPageDestroyed(page: Page) {
+  protected cleanupPageDestroyed(page: Page) {
     const listeners = this.#listeners.get(page);
     if (listeners) {
       for (const [name, listener] of Object.entries(listeners)) {
@@ -133,12 +172,23 @@ export class PageCollector<T> {
     this.storage.delete(page);
   }
 
-  getData(page: Page): T[] {
+  getData(page: Page, includePreservedData?: boolean): T[] {
     const navigations = this.storage.get(page);
     if (!navigations) {
       return [];
     }
-    return navigations[0];
+
+    if (!includePreservedData) {
+      return navigations[0];
+    }
+
+    const data: T[] = [];
+    for (let index = this.maxNavigationSaved; index >= 0; index--) {
+      if (navigations[index]) {
+        data.push(...navigations[index]);
+      }
+    }
+    return data;
   }
 
   getIdForResource(resource: WithSymbolId<T>): number {
@@ -151,27 +201,190 @@ export class PageCollector<T> {
       throw new Error('No requests found for selected page');
     }
 
-    for (const navigation of navigations) {
-      for (const collected of navigation) {
-        if (collected[stableIdSymbol] === stableId) {
-          return collected;
-        }
-      }
+    const item = this.find(page, item => item[stableIdSymbol] === stableId);
+
+    if (item) {
+      return item;
     }
 
     throw new Error('Request not found for selected page');
   }
+
+  find(
+    page: Page,
+    filter: (item: WithSymbolId<T>) => boolean,
+  ): WithSymbolId<T> | undefined {
+    const navigations = this.storage.get(page);
+    if (!navigations) {
+      return;
+    }
+
+    for (const navigation of navigations) {
+      const item = navigation.find(filter);
+      if (item) {
+        return item;
+      }
+    }
+    return;
+  }
+}
+
+export class ConsoleCollector extends PageCollector<
+  ConsoleMessage | Error | DevTools.AggregatedIssue | UncaughtError
+> {
+  #subscribedPages = new WeakMap<Page, PageEventSubscriber>();
+
+  override addPage(page: Page): void {
+    super.addPage(page);
+    if (!this.#subscribedPages.has(page)) {
+      const subscriber = new PageEventSubscriber(page);
+      this.#subscribedPages.set(page, subscriber);
+      void subscriber.subscribe();
+    }
+  }
+
+  protected override cleanupPageDestroyed(page: Page): void {
+    super.cleanupPageDestroyed(page);
+    this.#subscribedPages.get(page)?.unsubscribe();
+    this.#subscribedPages.delete(page);
+  }
+}
+
+class PageEventSubscriber {
+  #issueManager = new FakeIssuesManager();
+  #issueAggregator = new DevTools.IssueAggregator(this.#issueManager);
+  #seenKeys = new Set<string>();
+  #seenIssues = new Set<DevTools.AggregatedIssue>();
+  #page: Page;
+  #session: CDPSession;
+  #targetId: string;
+
+  constructor(page: Page) {
+    this.#page = page;
+    // @ts-expect-error use existing CDP client (internal Puppeteer API).
+    this.#session = this.#page._client() as CDPSession;
+    // @ts-expect-error use internal Puppeteer API to get target ID
+    this.#targetId = this.#session.target()._targetId;
+  }
+
+  #resetIssueAggregator() {
+    this.#issueManager = new FakeIssuesManager();
+    if (this.#issueAggregator) {
+      this.#issueAggregator.removeEventListener(
+        DevTools.IssueAggregatorEvents.AGGREGATED_ISSUE_UPDATED,
+        this.#onAggregatedIssue,
+      );
+    }
+    this.#issueAggregator = new DevTools.IssueAggregator(this.#issueManager);
+    this.#issueAggregator.addEventListener(
+      DevTools.IssueAggregatorEvents.AGGREGATED_ISSUE_UPDATED,
+      this.#onAggregatedIssue,
+    );
+  }
+
+  async subscribe() {
+    this.#resetIssueAggregator();
+    this.#page.on('framenavigated', this.#onFrameNavigated);
+    this.#session.on('Audits.issueAdded', this.#onIssueAdded);
+    this.#session.on('Runtime.exceptionThrown', this.#onExceptionThrown);
+    try {
+      await this.#session.send('Audits.enable');
+    } catch (error) {
+      logger('Error subscribing to issues', error);
+    }
+  }
+
+  unsubscribe() {
+    this.#seenKeys.clear();
+    this.#seenIssues.clear();
+    this.#page.off('framenavigated', this.#onFrameNavigated);
+    this.#session.off('Audits.issueAdded', this.#onIssueAdded);
+    this.#session.off('Runtime.exceptionThrown', this.#onExceptionThrown);
+    if (this.#issueAggregator) {
+      this.#issueAggregator.removeEventListener(
+        DevTools.IssueAggregatorEvents.AGGREGATED_ISSUE_UPDATED,
+        this.#onAggregatedIssue,
+      );
+    }
+    void this.#session.send('Audits.disable').catch(() => {
+      // might fail.
+    });
+  }
+
+  #onAggregatedIssue = (
+    event: DevTools.Common.EventTarget.EventTargetEvent<DevTools.AggregatedIssue>,
+  ) => {
+    if (this.#seenIssues.has(event.data)) {
+      return;
+    }
+    this.#seenIssues.add(event.data);
+    this.#page.emit('issue', event.data);
+  };
+
+  #onExceptionThrown = (event: Protocol.Runtime.ExceptionThrownEvent) => {
+    this.#page.emit(
+      'uncaughtError',
+      new UncaughtError(event.exceptionDetails, this.#targetId),
+    );
+  };
+
+  // On navigation, we reset issue aggregation.
+  #onFrameNavigated = (frame: Frame) => {
+    // Only split the storage on main frame navigation
+    if (frame !== frame.page().mainFrame()) {
+      return;
+    }
+    this.#seenKeys.clear();
+    this.#seenIssues.clear();
+    this.#resetIssueAggregator();
+  };
+
+  #onIssueAdded = (data: Protocol.Audits.IssueAddedEvent) => {
+    try {
+      const inspectorIssue = data.issue;
+      const issue = DevTools.createIssuesFromProtocolIssue(
+        null,
+        // @ts-expect-error Protocol types diverge.
+        inspectorIssue,
+      )[0];
+      if (!issue) {
+        logger('No issue mapping for for the issue: ', inspectorIssue.code);
+        return;
+      }
+
+      const primaryKey = issue.primaryKey();
+      if (this.#seenKeys.has(primaryKey)) {
+        return;
+      }
+      this.#seenKeys.add(primaryKey);
+      this.#issueManager.dispatchEventToListeners(
+        DevTools.IssuesManagerEvents.ISSUE_ADDED,
+        {
+          issue,
+          // @ts-expect-error We don't care that issues model is null
+          issuesModel: null,
+        },
+      );
+    } catch (error) {
+      logger('Error creating a new issue', error);
+    }
+  };
 }
 
 export class NetworkCollector extends PageCollector<HTTPRequest> {
-  constructor(browser: Browser) {
-    super(browser, collect => {
+  constructor(
+    browser: Browser,
+    listeners: (
+      collector: (item: HTTPRequest) => void,
+    ) => ListenerMap<PageEvents> = collect => {
       return {
         request: req => {
           collect(req);
         },
       } as ListenerMap;
-    });
+    },
+  ) {
+    super(browser, listeners);
   }
   override splitAfterNavigation(page: Page) {
     const navigations = this.storage.get(page) ?? [];
@@ -190,11 +403,12 @@ export class NetworkCollector extends PageCollector<HTTPRequest> {
     // Keep all requests since the last navigation request including that
     // navigation request itself.
     // Keep the reference
-    if (lastRequestIdx) {
+    if (lastRequestIdx !== -1) {
       const fromCurrentNavigation = requests.splice(lastRequestIdx);
       navigations.unshift(fromCurrentNavigation);
     } else {
       navigations.unshift([]);
     }
+    navigations.splice(this.maxNavigationSaved);
   }
 }

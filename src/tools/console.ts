@@ -4,16 +4,16 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import type {ConsoleMessageType} from 'puppeteer-core';
+import {zod} from '../third_party/index.js';
+import type {ConsoleMessageType} from '../third_party/index.js';
 
-import {zod} from '../third_party/modelcontextprotocol-sdk/index.js';
+import {ToolCategory} from './categories.js';
+import {definePageTool} from './ToolDefinition.js';
+type ConsoleResponseType = ConsoleMessageType | 'issue';
 
-import {ToolCategories} from './categories.js';
-import {defineTool} from './ToolDefinition.js';
-
-const FILTERABLE_MESSAGE_TYPES: readonly [
-  ConsoleMessageType,
-  ...ConsoleMessageType[],
+const FILTERABLE_MESSAGE_TYPES: [
+  ConsoleResponseType,
+  ...ConsoleResponseType[],
 ] = [
   'log',
   'debug',
@@ -34,14 +34,15 @@ const FILTERABLE_MESSAGE_TYPES: readonly [
   'count',
   'timeEnd',
   'verbose',
+  'issue',
 ];
 
-export const listConsoleMessages = defineTool({
+export const listConsoleMessages = definePageTool({
   name: 'list_console_messages',
   description:
     'List all console messages for the currently selected page since the last navigation.',
   annotations: {
-    category: ToolCategories.DEBUGGING,
+    category: ToolCategory.DEBUGGING,
     readOnlyHint: true,
   },
   schema: {
@@ -67,21 +68,29 @@ export const listConsoleMessages = defineTool({
       .describe(
         'Filter messages to only return messages of the specified resource types. When omitted or empty, returns all messages.',
       ),
+    includePreservedMessages: zod
+      .boolean()
+      .default(false)
+      .optional()
+      .describe(
+        'Set to true to return the preserved messages over the last 3 navigations.',
+      ),
   },
   handler: async (request, response) => {
     response.setIncludeConsoleData(true, {
       pageSize: request.params.pageSize,
       pageIdx: request.params.pageIdx,
       types: request.params.types,
+      includePreservedMessages: request.params.includePreservedMessages,
     });
   },
 });
 
-export const getConsoleMessage = defineTool({
+export const getConsoleMessage = definePageTool({
   name: 'get_console_message',
   description: `Gets a console message by its ID. You can get all messages by calling ${listConsoleMessages.name}.`,
   annotations: {
-    category: ToolCategories.DEBUGGING,
+    category: ToolCategory.DEBUGGING,
     readOnlyHint: true,
   },
   schema: {

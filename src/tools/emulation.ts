@@ -2,88 +2,72 @@
  * @license
  * Copyright 2025 Google LLC
  * SPDX-License-Identifier: Apache-2.0
+ *
  */
 
-import {PredefinedNetworkConditions} from 'puppeteer-core';
+import {zod, PredefinedNetworkConditions} from '../third_party/index.js';
 
-import {zod} from '../third_party/modelcontextprotocol-sdk/index.js';
-
-import {ToolCategories} from './categories.js';
-import {defineTool} from './ToolDefinition.js';
+import {ToolCategory} from './categories.js';
+import {
+  definePageTool,
+  geolocationTransform,
+  viewportTransform,
+} from './ToolDefinition.js';
 
 const throttlingOptions: [string, ...string[]] = [
-  'No emulation',
   'Offline',
   ...Object.keys(PredefinedNetworkConditions),
 ];
 
-export const emulateNetwork = defineTool({
-  name: 'emulate_network',
-  description: `Emulates network conditions such as throttling or offline mode on the selected page.`,
+export const emulate = definePageTool({
+  name: 'emulate',
+  description: `Emulates various features on the selected page.`,
   annotations: {
-    category: ToolCategories.EMULATION,
+    category: ToolCategory.EMULATION,
     readOnlyHint: false,
   },
   schema: {
-    throttlingOption: zod
+    networkConditions: zod
       .enum(throttlingOptions)
-      .describe(
-        `The network throttling option to emulate. Available throttling options are: ${throttlingOptions.join(', ')}. Set to "No emulation" to disable. Set to "Offline" to simulate offline network conditions.`,
-      ),
-  },
-  handler: async (request, _response, context) => {
-    const page = context.getSelectedPage();
-    const conditions = request.params.throttlingOption;
-
-    if (conditions === 'No emulation') {
-      await page.emulateNetworkConditions(null);
-      context.setNetworkConditions(null);
-      return;
-    }
-
-    if (conditions === 'Offline') {
-      await page.emulateNetworkConditions({
-        offline: true,
-        download: 0,
-        upload: 0,
-        latency: 0,
-      });
-      context.setNetworkConditions('Offline');
-      return;
-    }
-
-    if (conditions in PredefinedNetworkConditions) {
-      const networkCondition =
-        PredefinedNetworkConditions[
-          conditions as keyof typeof PredefinedNetworkConditions
-        ];
-      await page.emulateNetworkConditions(networkCondition);
-      context.setNetworkConditions(conditions);
-    }
-  },
-});
-
-export const emulateCpu = defineTool({
-  name: 'emulate_cpu',
-  description: `Emulates CPU throttling by slowing down the selected page's execution.`,
-  annotations: {
-    category: ToolCategories.EMULATION,
-    readOnlyHint: false,
-  },
-  schema: {
-    throttlingRate: zod
+      .optional()
+      .describe(`Throttle network. Omit to disable throttling.`),
+    cpuThrottlingRate: zod
       .number()
       .min(1)
       .max(20)
+      .optional()
       .describe(
-        'The CPU throttling rate representing the slowdown factor 1-20x. Set the rate to 1 to disable throttling',
+        'Represents the CPU slowdown factor. Omit or set the rate to 1 to disable throttling',
+      ),
+    geolocation: zod
+      .string()
+      .optional()
+      .transform(geolocationTransform)
+      .describe(
+        'Geolocation (`<latitude>x<longitude>`) to emulate. Latitude between -90 and 90. Longitude between -180 and 180. Omit clear the geolocation override.',
+      ),
+    userAgent: zod
+      .string()
+      .optional()
+      .describe(
+        'User agent to emulate. Set to empty string to clear the user agent override.',
+      ),
+    colorScheme: zod
+      .enum(['dark', 'light', 'auto'])
+      .optional()
+      .describe(
+        'Emulate the dark or the light mode. Set to "auto" to reset to the default.',
+      ),
+    viewport: zod
+      .string()
+      .optional()
+      .transform(viewportTransform)
+      .describe(
+        `Emulate device viewports '<width>x<height>x<devicePixelRatio>[,mobile][,touch][,landscape]'. 'touch' and 'mobile' to emulate mobile devices. 'landscape' to emulate landscape mode.`,
       ),
   },
   handler: async (request, _response, context) => {
-    const page = context.getSelectedPage();
-    const {throttlingRate} = request.params;
-
-    await page.emulateCPUThrottling(throttlingRate);
-    context.setCpuThrottlingRate(throttlingRate);
+    const page = request.page;
+    await context.emulate(request.params, page.pptrPage);
   },
 });

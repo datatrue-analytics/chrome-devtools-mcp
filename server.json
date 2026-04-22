@@ -1,18 +1,19 @@
 {
-  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-10-17/server.schema.json",
-  "name": "io.github.ChromeDevTools/chrome-devtools-mcp",
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.datatrue-analytics/chrome-devtools-mcp",
+  "title": "Chrome DevTools MCP",
   "description": "MCP server for Chrome DevTools",
   "repository": {
-    "url": "https://github.com/ChromeDevTools/chrome-devtools-mcp",
+    "url": "https://github.com/datatrue-analytics/chrome-devtools-mcp",
     "source": "github"
   },
-  "version": "0.8.1",
+  "version": "0.20.3-datatrue.1",
   "packages": [
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "chrome-devtools-mcp",
-      "version": "0.8.1",
+      "version": "0.20.3",
       "transport": {
         "type": "stdio"
       },

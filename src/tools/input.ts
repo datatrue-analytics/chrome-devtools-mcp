@@ -4,19 +4,49 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import type {ElementHandle} from 'puppeteer-core';
+import {logger} from '../logger.js';
+import type {McpContext} from '../McpContext.js';
+import {zod} from '../third_party/index.js';
+import type {ElementHandle, KeyInput} from '../third_party/index.js';
+import type {TextSnapshotNode} from '../types.js';
+import {parseKey} from '../utils/keyboard.js';
 
-import type {McpContext, TextSnapshotNode} from '../McpContext.js';
-import {zod} from '../third_party/modelcontextprotocol-sdk/index.js';
+import {ToolCategory} from './categories.js';
+import type {ContextPage} from './ToolDefinition.js';
+import {definePageTool} from './ToolDefinition.js';
 
-import {ToolCategories} from './categories.js';
-import {defineTool} from './ToolDefinition.js';
+const dblClickSchema = zod
+  .boolean()
+  .optional()
+  .describe('Set to true for double clicks. Default is false.');
 
-export const click = defineTool({
+const includeSnapshotSchema = zod
+  .boolean()
+  .optional()
+  .describe('Whether to include a snapshot in the response. Default is false.');
+
+const submitKeySchema = zod
+  .string()
+  .optional()
+  .describe(
+    'Optional key to press after typing. E.g., "Enter", "Tab", "Escape"',
+  );
+
+function handleActionError(error: unknown, uid: string) {
+  logger('failed to act using a locator', error);
+  throw new Error(
+    `Failed to interact with the element with uid ${uid}. The element did not become interactive within the configured timeout.`,
+    {
+      cause: error,
+    },
+  );
+}
+
+export const click = definePageTool({
   name: 'click',
   description: `Clicks on the provided element`,
   annotations: {
-    category: ToolCategories.INPUT_AUTOMATION,
+    category: ToolCategory.INPUT,
     readOnlyHint: false,
   },
   schema: {
@@ -25,14 +55,12 @@ export const click = defineTool({
       .describe(
         'The uid of an element on the page from the page content snapshot',
       ),
-    dblClick: zod
-      .boolean()
-      .optional()
-      .describe('Set to true for double clicks. Default is false.'),
+    dblClick: dblClickSchema,
+    includeSnapshot: includeSnapshotSchema,
   },
   handler: async (request, response, context) => {
     const uid = request.params.uid;
-    const handle = await context.getElementByUid(uid);
+    const handle = await request.page.getElementByUid(uid);
     try {
       await context.waitForEventsAfterAction(async () => {
         await handle.asLocator().click({
@@ -44,18 +72,54 @@ export const click = defineTool({
           ? `Successfully double clicked on the element`
           : `Successfully clicked on the element`,
       );
-      response.setIncludeSnapshot(true);
+      if (request.params.includeSnapshot) {
+        response.includeSnapshot();
+      }
+    } catch (error) {
+      handleActionError(error, uid);
     } finally {
       void handle.dispose();
     }
   },
 });
 
-export const hover = defineTool({
+export const clickAt = definePageTool({
+  name: 'click_at',
+  description: `Clicks at the provided coordinates`,
+  annotations: {
+    category: ToolCategory.INPUT,
+    readOnlyHint: false,
+    conditions: ['computerVision'],
+  },
+  schema: {
+    x: zod.number().describe('The x coordinate'),
+    y: zod.number().describe('The y coordinate'),
+    dblClick: dblClickSchema,
+    includeSnapshot: includeSnapshotSchema,
+  },
+  handler: async (request, response, context) => {
+    const page = request.page;
+    await context.waitForEventsAfterAction(async () => {
+      await page.pptrPage.mouse.click(request.params.x, request.params.y, {
+        clickCount: request.params.dblClick ? 2 : 1,
+      });
+    });
+    response.appendResponseLine(
+      request.params.dblClick
+        ? `Successfully double clicked at the coordinates`
+        : `Successfully clicked at the coordinates`,
+    );
+    if (request.params.includeSnapshot) {
+      response.includeSnapshot();
+    }
+  },
+});
+
+export const hover = definePageTool({
   name: 'hover',
   description: `Hover over the provided element`,
   annotations: {
-    category: ToolCategories.INPUT_AUTOMATION,
+    category: ToolCategory.INPUT,
     readOnlyHint: false,
   },
   schema: {
@@ -64,16 +128,21 @@ export const hover = defineTool({
       .describe(
         'The uid of an element on the page from the page content snapshot',
       ),
+    includeSnapshot: includeSnapshotSchema,
   },
   handler: async (request, response, context) => {
     const uid = request.params.uid;
-    const handle = await context.getElementByUid(uid);
+    const handle = await request.page.getElementByUid(uid);
     try {
       await context.waitForEventsAfterAction(async () => {
         await handle.asLocator().hover();
       });
       response.appendResponseLine(`Successfully hovered over the element`);
-      response.setIncludeSnapshot(true);
+      if (request.params.includeSnapshot) {
+        response.includeSnapshot();
+      }
+    } catch (error) {
+      handleActionError(error, uid);
     } finally {
       void handle.dispose();
     }
@@ -117,29 +186,42 @@ async function selectOption(
   }
 }
 
+function hasOptionChildren(aXNode: TextSnapshotNode) {
+  return aXNode.children.some(child => child.role === 'option');
+}
+
 async function fillFormElement(
   uid: string,
   value: string,
   context: McpContext,
+  page: ContextPage,
 ) {
-  const handle = await context.getElementByUid(uid);
+  const handle = await page.getElementByUid(uid);
   try {
     const aXNode = context.getAXNodeByUid(uid);
-    if (aXNode && aXNode.role === 'combobox') {
+    // We assume that combobox needs to be handled as select if it has
+    // role='combobox' and option children.
+    if (aXNode && aXNode.role === 'combobox' && hasOptionChildren(aXNode)) {
       await selectOption(handle, aXNode, value);
     } else {
-      await handle.asLocator().fill(value);
+      // Increase timeout for longer input values.
+      const timeoutPerChar = 10; // ms
+      const fillTimeout =
+        page.pptrPage.getDefaultTimeout() + value.length * timeoutPerChar;
+      await handle.asLocator().setTimeout(fillTimeout).fill(value);
     }
+  } catch (error) {
+    handleActionError(error, uid);
   } finally {
     void handle.dispose();
   }
 }
 
-export const fill = defineTool({
+export const fill = definePageTool({
   name: 'fill',
   description: `Type text into a input, text area or select an option from a <select> element.`,
   annotations: {
-    category: ToolCategories.INPUT_AUTOMATION,
+    category: ToolCategory.INPUT,
     readOnlyHint: false,
   },
   schema: {
@@ -149,34 +231,69 @@ export const fill = defineTool({
         'The uid of an element on the page from the page content snapshot',
       ),
     value: zod.string().describe('The value to fill in'),
+    includeSnapshot: includeSnapshotSchema,
   },
   handler: async (request, response, context) => {
+    const page = request.page;
     await context.waitForEventsAfterAction(async () => {
       await fillFormElement(
         request.params.uid,
         request.params.value,
         context as McpContext,
+        page,
       );
     });
     response.appendResponseLine(`Successfully filled out the element`);
-    response.setIncludeSnapshot(true);
+    if (request.params.includeSnapshot) {
+      response.includeSnapshot();
+    }
   },
 });
 
-export const drag = defineTool({
+export const typeText = definePageTool({
+  name: 'type_text',
+  description: `Type text using keyboard into a previously focused input`,
+  annotations: {
+    category: ToolCategory.INPUT,
+    readOnlyHint: false,
+  },
+  schema: {
+    text: zod.string().describe('The text to type'),
+    submitKey: submitKeySchema,
+  },
+  handler: async (request, response, context) => {
+    const page = request.page;
+    await context.waitForEventsAfterAction(async () => {
+      await page.pptrPage.keyboard.type(request.params.text);
+      if (request.params.submitKey) {
+        await page.pptrPage.keyboard.press(
+          request.params.submitKey as KeyInput,
+        );
+      }
+    });
+    response.appendResponseLine(
+      `Typed text "${request.params.text}${request.params.submitKey ? ` + ${request.params.submitKey}` : ''}"`,
+    );
+  },
+});
+
+export const drag = definePageTool({
   name: 'drag',
   description: `Drag an element onto another element`,
   annotations: {
-    category: ToolCategories.INPUT_AUTOMATION,
+    category: ToolCategory.INPUT,
     readOnlyHint: false,
   },
   schema: {
     from_uid: zod.string().describe('The uid of the element to drag'),
     to_uid: zod.string().describe('The uid of the element to drop into'),
+    includeSnapshot: includeSnapshotSchema,
   },
   handler: async (request, response, context) => {
-    const fromHandle = await context.getElementByUid(request.params.from_uid);
-    const toHandle = await context.getElementByUid(request.params.to_uid);
+    const fromHandle = await request.page.getElementByUid(
+      request.params.from_uid,
+    );
+    const toHandle = await request.page.getElementByUid(request.params.to_uid);
     try {
       await context.waitForEventsAfterAction(async () => {
         await fromHandle.drag(toHandle);
@@ -184,7 +301,9 @@ export const drag = defineTool({
         await toHandle.drop(fromHandle);
       });
       response.appendResponseLine(`Successfully dragged an element`);
-      response.setIncludeSnapshot(true);
+      if (request.params.includeSnapshot) {
+        response.includeSnapshot();
+      }
     } finally {
       void fromHandle.dispose();
       void toHandle.dispose();
@@ -192,11 +311,11 @@ export const drag = defineTool({
   },
 });
 
-export const fillForm = defineTool({
+export const fillForm = definePageTool({
   name: 'fill_form',
   description: `Fill out multiple form elements at once`,
   annotations: {
-    category: ToolCategories.INPUT_AUTOMATION,
+    category: ToolCategory.INPUT,
     readOnlyHint: false,
   },
   schema: {
@@ -208,27 +327,32 @@ export const fillForm = defineTool({
         }),
       )
       .describe('Elements from snapshot to fill out.'),
+    includeSnapshot: includeSnapshotSchema,
   },
   handler: async (request, response, context) => {
+    const page = request.page;
     for (const element of request.params.elements) {
       await context.waitForEventsAfterAction(async () => {
         await fillFormElement(
           element.uid,
           element.value,
           context as McpContext,
+          page,
         );
       });
     }
     response.appendResponseLine(`Successfully filled out the form`);
-    response.setIncludeSnapshot(true);
+    if (request.params.includeSnapshot) {
+      response.includeSnapshot();
+    }
   },
 });
 
-export const uploadFile = defineTool({
+export const uploadFile = definePageTool({
   name: 'upload_file',
   description: 'Upload a file through a provided element.',
   annotations: {
-    category: ToolCategories.INPUT_AUTOMATION,
+    category: ToolCategory.INPUT,
     readOnlyHint: false,
   },
   schema: {
@@ -238,10 +362,11 @@ export const uploadFile = defineTool({
         'The uid of the file input element or an element that will open file chooser on the page from the page content snapshot',
       ),
     filePath: zod.string().describe('The local path of the file to upload'),
+    includeSnapshot: includeSnapshotSchema,
   },
-  handler: async (request, response, context) => {
+  handler: async (request, response) => {
     const {uid, filePath} = request.params;
-    const handle = (await context.getElementByUid(
+    const handle = (await request.page.getElementByUid(
       uid,
     )) as ElementHandle<HTMLInputElement>;
     try {
@@ -252,9 +377,8 @@ export const uploadFile = defineTool({
         // a type=file element. In this case, we want to default to
         // Page.waitForFileChooser() and upload the file this way.
         try {
-          const page = context.getSelectedPage();
           const [fileChooser] = await Promise.all([
-            page.waitForFileChooser({timeout: 3000}),
+            request.page.pptrPage.waitForFileChooser({timeout: 3000}),
             handle.asLocator().click(),
           ]);
           await fileChooser.accept([filePath]);
@@ -264,10 +388,51 @@ export const uploadFile = defineTool({
           );
         }
       }
-      response.setIncludeSnapshot(true);
+      if (request.params.includeSnapshot) {
+        response.includeSnapshot();
+      }
       response.appendResponseLine(`File uploaded from ${filePath}.`);
     } finally {
       void handle.dispose();
+    }
+  },
+});
+
+export const pressKey = definePageTool({
+  name: 'press_key',
+  description: `Press a key or key combination. Use this when other input methods like fill() cannot be used (e.g., keyboard shortcuts, navigation keys, or special key combinations).`,
+  annotations: {
+    category: ToolCategory.INPUT,
+    readOnlyHint: false,
+  },
+  schema: {
+    key: zod
+      .string()
+      .describe(
+        'A key or a combination (e.g., "Enter", "Control+A", "Control++", "Control+Shift+R"). Modifiers: Control, Shift, Alt, Meta',
+      ),
+    includeSnapshot: includeSnapshotSchema,
+  },
+  handler: async (request, response, context) => {
+    const page = request.page;
+    const tokens = parseKey(request.params.key);
+    const [key, ...modifiers] = tokens;
+
+    await context.waitForEventsAfterAction(async () => {
+      for (const modifier of modifiers) {
+        await page.pptrPage.keyboard.down(modifier);
+      }
+      await page.pptrPage.keyboard.press(key);
+      for (const modifier of modifiers.toReversed()) {
+        await page.pptrPage.keyboard.up(modifier);
+      }
+    });
+
+    response.appendResponseLine(
+      `Successfully pressed key: ${request.params.key}`,
+    );
+    if (request.params.includeSnapshot) {
+      response.includeSnapshot();
     }
   },
 });

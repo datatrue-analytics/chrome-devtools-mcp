@@ -9,20 +9,87 @@ import fs from 'node:fs';
 import {Client} from '@modelcontextprotocol/sdk/client/index.js';
 import {StdioClientTransport} from '@modelcontextprotocol/sdk/client/stdio.js';
 import type {Tool} from '@modelcontextprotocol/sdk/types.js';
+import {get_encoding} from 'tiktoken';
 
-import {cliOptions} from '../build/src/cli.js';
-import {ToolCategories} from '../build/src/tools/categories.js';
+import {cliOptions} from '../build/src/bin/chrome-devtools-mcp-cli-options.js';
+import type {ParsedArguments} from '../build/src/bin/chrome-devtools-mcp-cli-options.js';
+import {ToolCategory, labels} from '../build/src/tools/categories.js';
+import {createTools} from '../build/src/tools/tools.js';
 
-const MCP_SERVER_PATH = 'build/src/index.js';
 const OUTPUT_PATH = './docs/tool-reference.md';
+const SLIM_OUTPUT_PATH = './docs/slim-tool-reference.md';
 const README_PATH = './README.md';
+
+async function measureServer(args: string[]) {
+  // 1. Connect to your actual MCP server
+  const transport = new StdioClientTransport({
+    command: 'node',
+    args: ['./build/src/bin/chrome-devtools-mcp.js', ...args], // Point to your built MCP server
+  });
+
+  const client = new Client(
+    {name: 'measurer', version: '1.0.0'},
+    {capabilities: {}},
+  );
+  await client.connect(transport);
+
+  // 2. Fetch all tools
+  const toolsList = await client.listTools();
+
+  // 3. Serialize exactly how an LLM would see it (JSON)
+  const jsonString = JSON.stringify(toolsList.tools, null, 2);
+
+  // 4. Count tokens (using cl100k_base which is standard for GPT-4/Claude-3.5 approximation)
+  const enc = get_encoding('cl100k_base');
+  const tokenCount = enc.encode(jsonString).length;
+
+  console.log(`--- Measurement Results ---`);
+  console.log(`Total Tools: ${toolsList.tools.length}`);
+  console.log(`JSON Character Count: ${jsonString.length}`);
+  console.log(`Estimated Token Count: ~${tokenCount}`);
+
+  // Clean up
+  enc.free();
+  await client.close();
+  return {
+    tokenCount,
+  };
+}
 
 // Extend the MCP Tool type to include our annotations
 interface ToolWithAnnotations extends Tool {
   annotations?: {
     title?: string;
-    category?: ToolCategories;
+    category?: typeof ToolCategory;
+    conditions?: string[];
   };
+}
+
+interface ZodCheck {
+  kind: string;
+}
+
+interface ZodDef {
+  typeName: string;
+  checks?: ZodCheck[];
+  values?: string[];
+  type?: ZodSchema;
+  innerType?: ZodSchema;
+  schema?: ZodSchema;
+  defaultValue?: () => unknown;
+}
+
+interface ZodSchema {
+  _def: ZodDef;
+  description?: string;
+}
+
+interface TypeInfo {
+  type: string;
+  enum?: string[];
+  items?: TypeInfo;
+  description?: string;
+  default?: unknown;
 }
 
 function escapeHtmlTags(text: string): string {
@@ -44,7 +111,7 @@ function addCrossLinks(text: string, tools: ToolWithAnnotations[]): string {
 
   for (const toolName of sortedToolNames) {
     // Create regex to match tool name (case insensitive, word boundaries)
-    const regex = new RegExp(`\\b${toolName.replace(/_/g, '_')}\\b`, 'gi');
+    const regex = new RegExp(`\\b${toolName}\\b`, 'gi');
 
     result = result.replace(regex, match => {
       // Only create link if the match isn't already inside a link
@@ -67,7 +134,7 @@ function generateToolsTOC(
 
   for (const category of sortedCategories) {
     const categoryTools = categories[category];
-    const categoryName = category;
+    const categoryName = labels[category];
     toc += `- **${categoryName}** (${categoryTools.length} tools)\n`;
 
     // Sort tools within category for TOC
@@ -116,8 +183,17 @@ function generateConfigOptionsMarkdown(): string {
     const aliasText = optionConfig.alias ? `, \`-${optionConfig.alias}\`` : '';
     const description = optionConfig.description || optionConfig.describe || '';
 
+    // Convert camelCase to dash-case
+    const dashCaseName = optionName
+      .replace(/([a-z])([A-Z])/g, '$1-$2')
+      .toLowerCase();
+    const nameDisplay =
+      dashCaseName !== optionName
+        ? `\`--${optionName}\`/ \`--${dashCaseName}\``
+        : `\`--${optionName}\``;
+
     // Start with option name and description
-    markdown += `- **\`--${optionName}\`${aliasText}**\n`;
+    markdown += `- **${nameDisplay}${aliasText}**\n`;
     markdown += `  ${description}\n`;
 
     // Add type information
@@ -162,166 +238,303 @@ function updateReadmeWithOptionsMarkdown(optionsMarkdown: string): void {
   console.log('Updated README.md with options markdown');
 }
 
-async function generateToolDocumentation(): Promise<void> {
-  console.log('Starting MCP server to query tool definitions...');
+// Helper to convert Zod schema to JSON schema-like object for docs
+function getZodTypeInfo(schema: ZodSchema): TypeInfo {
+  let description = schema.description;
+  let def = schema._def;
+  let defaultValue: unknown;
 
-  // Create MCP client with stdio transport pointing to the built server
-  const transport = new StdioClientTransport({
-    command: 'node',
-    args: [MCP_SERVER_PATH, '--channel', 'canary'],
-  });
+  // Unwrap optional/default/effects
+  while (
+    def.typeName === 'ZodOptional' ||
+    def.typeName === 'ZodDefault' ||
+    def.typeName === 'ZodEffects'
+  ) {
+    if (def.typeName === 'ZodDefault' && def.defaultValue) {
+      defaultValue = def.defaultValue();
+    }
+    const next = def.innerType || def.schema;
+    if (!next) {
+      break;
+    }
+    schema = next;
+    def = schema._def;
+    if (!description && schema.description) {
+      description = schema.description;
+    }
+  }
 
-  const client = new Client(
-    {
-      name: 'docs-generator',
-      version: '1.0.0',
-    },
-    {
-      capabilities: {},
-    },
-  );
+  const result: TypeInfo = {type: 'unknown'};
+  if (description) {
+    result.description = description;
+  }
+  if (defaultValue !== undefined) {
+    result.default = defaultValue;
+  }
 
-  try {
-    // Connect to the server
-    await client.connect(transport);
-    console.log('Connected to MCP server');
+  switch (def.typeName) {
+    case 'ZodString':
+      result.type = 'string';
+      break;
+    case 'ZodNumber':
+      result.type = def.checks?.some((c: ZodCheck) => c.kind === 'int')
+        ? 'integer'
+        : 'number';
+      break;
+    case 'ZodBoolean':
+      result.type = 'boolean';
+      break;
+    case 'ZodEnum':
+      result.type = 'string';
+      result.enum = def.values;
+      break;
+    case 'ZodArray':
+      result.type = 'array';
+      if (def.type) {
+        result.items = getZodTypeInfo(def.type);
+      }
+      break;
+    default:
+      result.type = 'unknown';
+  }
+  return result;
+}
 
-    // List all available tools
-    const {tools} = await client.listTools();
-    const toolsWithAnnotations = tools as ToolWithAnnotations[];
-    console.log(`Found ${tools.length} tools`);
+function isRequired(schema: ZodSchema): boolean {
+  let def = schema._def;
+  while (def.typeName === 'ZodEffects') {
+    if (!def.schema) {
+      break;
+    }
+    schema = def.schema;
+    def = schema._def;
+  }
+  return def.typeName !== 'ZodOptional' && def.typeName !== 'ZodDefault';
+}
 
-    // Generate markdown documentation
-    let markdown = `<!-- AUTO GENERATED DO NOT EDIT - run 'npm run docs' to update-->
+async function generateReference(
+  title: string,
+  outputPath: string,
+  toolsWithAnnotations: ToolWithAnnotations[],
+  categories: Record<string, ToolWithAnnotations[]>,
+  sortedCategories: string[],
+  serverArgs: string[],
+) {
+  console.log(`Found ${toolsWithAnnotations.length} tools`);
 
-# Chrome DevTools MCP Tool Reference
+  // Generate markdown documentation
+  let markdown = `<!-- AUTO GENERATED DO NOT EDIT - run 'npm run gen' to update-->
+
+# ${title} (~${(await measureServer(serverArgs)).tokenCount} cl100k_base tokens)
 
 `;
+  // Generate table of contents
+  for (const category of sortedCategories) {
+    const categoryTools = categories[category];
+    const categoryName = labels[category];
+    const anchorName = categoryName.toLowerCase().replace(/\s+/g, '-');
+    markdown += `- **[${categoryName}](#${anchorName})** (${categoryTools.length} tools)\n`;
 
-    // Group tools by category (based on annotations)
-    const categories: Record<string, ToolWithAnnotations[]> = {};
-    toolsWithAnnotations.forEach((tool: ToolWithAnnotations) => {
-      const category = tool.annotations?.category || 'Uncategorized';
-      if (!categories[category]) {
-        categories[category] = [];
-      }
-      categories[category].push(tool);
-    });
-
-    // Sort categories using the enum order
-    const categoryOrder = Object.values(ToolCategories);
-    const sortedCategories = Object.keys(categories).sort((a, b) => {
-      const aIndex = categoryOrder.indexOf(a);
-      const bIndex = categoryOrder.indexOf(b);
-      // Put known categories first, unknown categories last
-      if (aIndex === -1 && bIndex === -1) return a.localeCompare(b);
-      if (aIndex === -1) return 1;
-      if (bIndex === -1) return -1;
-      return aIndex - bIndex;
-    });
-
-    // Generate table of contents
-    for (const category of sortedCategories) {
-      const categoryTools = categories[category];
-      const categoryName = category;
-      const anchorName = category.toLowerCase().replace(/\s+/g, '-');
-      markdown += `- **[${categoryName}](#${anchorName})** (${categoryTools.length} tools)\n`;
-
-      // Sort tools within category for TOC
-      categoryTools.sort((a: Tool, b: Tool) => a.name.localeCompare(b.name));
-      for (const tool of categoryTools) {
-        // Generate proper markdown anchor link: backticks are removed, keep underscores, lowercase
-        const anchorLink = tool.name.toLowerCase();
-        markdown += `  - [\`${tool.name}\`](#${anchorLink})\n`;
-      }
+    // Sort tools within category for TOC
+    categoryTools.sort((a: Tool, b: Tool) => a.name.localeCompare(b.name));
+    for (const tool of categoryTools) {
+      // Generate proper markdown anchor link: backticks are removed, keep underscores, lowercase
+      const anchorLink = tool.name.toLowerCase();
+      markdown += `  - [\`${tool.name}\`](#${anchorLink})\n`;
     }
-    markdown += '\n';
+  }
+  markdown += '\n';
 
-    for (const category of sortedCategories) {
-      const categoryTools = categories[category];
+  for (const category of sortedCategories) {
+    const categoryTools = categories[category];
+    const categoryName = labels[category];
 
-      markdown += `## ${category}\n\n`;
+    markdown += `## ${categoryName}\n\n`;
 
-      // Sort tools within category
-      categoryTools.sort((a: Tool, b: Tool) => a.name.localeCompare(b.name));
+    // Sort tools within category
+    categoryTools.sort((a: Tool, b: Tool) => a.name.localeCompare(b.name));
 
-      for (const tool of categoryTools) {
-        markdown += `### \`${tool.name}\`\n\n`;
+    for (const tool of categoryTools) {
+      markdown += `### \`${tool.name}\`\n\n`;
 
-        if (tool.description) {
-          // Escape HTML tags but preserve JS function syntax
-          let escapedDescription = escapeHtmlTags(tool.description);
+      if (tool.description) {
+        // Escape HTML tags but preserve JS function syntax
+        let escapedDescription = escapeHtmlTags(tool.description);
 
-          // Add cross-links to mentioned tools
-          escapedDescription = addCrossLinks(
-            escapedDescription,
-            toolsWithAnnotations,
-          );
-          markdown += `**Description:** ${escapedDescription}\n\n`;
-        }
+        // Add cross-links to mentioned tools
+        escapedDescription = addCrossLinks(
+          escapedDescription,
+          toolsWithAnnotations,
+        );
+        markdown += `**Description:** ${escapedDescription}\n\n`;
+      }
 
-        // Handle input schema
-        if (
-          tool.inputSchema &&
-          tool.inputSchema.properties &&
-          Object.keys(tool.inputSchema.properties).length > 0
-        ) {
-          const properties = tool.inputSchema.properties;
-          const required = tool.inputSchema.required || [];
+      // Handle input schema
+      if (
+        tool.inputSchema &&
+        tool.inputSchema.properties &&
+        Object.keys(tool.inputSchema.properties).length > 0
+      ) {
+        const properties = tool.inputSchema.properties;
+        const required = tool.inputSchema.required || [];
 
-          markdown += '**Parameters:**\n\n';
+        markdown += '**Parameters:**\n\n';
 
-          const propertyNames = Object.keys(properties).sort();
-          for (const propName of propertyNames) {
-            const prop = properties[propName] as string;
-            const isRequired = required.includes(propName);
-            const requiredText = isRequired
-              ? ' **(required)**'
-              : ' _(optional)_';
+        const propertyNames = Object.keys(properties).sort((a, b) => {
+          const aRequired = required.includes(a);
+          const bRequired = required.includes(b);
+          if (aRequired && !bRequired) {
+            return -1;
+          }
+          if (!aRequired && bRequired) {
+            return 1;
+          }
+          return a.localeCompare(b);
+        });
+        for (const propName of propertyNames) {
+          const prop = properties[propName] as TypeInfo;
+          const isRequired = required.includes(propName);
+          const requiredText = isRequired ? ' **(required)**' : ' _(optional)_';
 
-            let typeInfo = prop.type || 'unknown';
-            if (prop.enum) {
-              typeInfo = `enum: ${prop.enum.map(v => `"${v}"`).join(', ')}`;
-            }
+          let typeInfo = prop.type || 'unknown';
+          if (prop.enum) {
+            typeInfo = `enum: ${prop.enum.map((v: string) => `"${v}"`).join(', ')}`;
+          }
 
-            markdown += `- **${propName}** (${typeInfo})${requiredText}`;
-            if (prop.description) {
-              let escapedParamDesc = escapeHtmlTags(prop.description);
+          markdown += `- **${propName}** (${typeInfo})${requiredText}`;
+          if (prop.description) {
+            let escapedParamDesc = escapeHtmlTags(prop.description);
 
-              // Add cross-links to mentioned tools
-              escapedParamDesc = addCrossLinks(
-                escapedParamDesc,
-                toolsWithAnnotations,
-              );
-              markdown += `: ${escapedParamDesc}`;
-            }
-            markdown += '\n';
+            // Add cross-links to mentioned tools
+            escapedParamDesc = addCrossLinks(
+              escapedParamDesc,
+              toolsWithAnnotations,
+            );
+            markdown += `: ${escapedParamDesc}`;
           }
           markdown += '\n';
-        } else {
-          markdown += '**Parameters:** None\n\n';
         }
-
-        markdown += '---\n\n';
+        markdown += '\n';
+      } else {
+        markdown += '**Parameters:** None\n\n';
       }
+
+      markdown += '---\n\n';
+    }
+  }
+
+  // Write the documentation to file
+  fs.writeFileSync(outputPath, markdown.trim() + '\n');
+
+  console.log(
+    `Generated documentation for ${toolsWithAnnotations.length} tools in ${outputPath}`,
+  );
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function getToolsAndCategories(tools: any) {
+  // Convert ToolDefinitions to ToolWithAnnotations
+  const toolsWithAnnotations: ToolWithAnnotations[] = tools
+    .filter(tool => {
+      if (!tool.annotations.conditions) {
+        return true;
+      }
+
+      // Only include unconditional tools.
+      return tool.annotations.conditions.length === 0;
+    })
+    .map(tool => {
+      const properties: Record<string, TypeInfo> = {};
+      const required: string[] = [];
+
+      for (const [key, schema] of Object.entries(
+        tool.schema as unknown as Record<string, ZodSchema>,
+      )) {
+        const info = getZodTypeInfo(schema);
+        properties[key] = info;
+        if (isRequired(schema)) {
+          required.push(key);
+        }
+      }
+
+      return {
+        name: tool.name,
+        description: tool.description,
+        inputSchema: {
+          type: 'object',
+          properties,
+          required,
+        },
+        annotations: tool.annotations,
+      };
+    });
+  // Group tools by category (based on annotations)
+  const categories: Record<string, ToolWithAnnotations[]> = {};
+  toolsWithAnnotations.forEach((tool: ToolWithAnnotations) => {
+    const category = tool.annotations?.category || 'Uncategorized';
+    if (!categories[category]) {
+      categories[category] = [];
+    }
+    categories[category].push(tool);
+  });
+
+  // Sort categories using the enum order
+  const categoryOrder = Object.values(ToolCategory);
+  const sortedCategories = Object.keys(categories).sort((a, b) => {
+    const aIndex = categoryOrder.indexOf(a);
+    const bIndex = categoryOrder.indexOf(b);
+    // Put known categories first, unknown categories last
+    if (aIndex === -1 && bIndex === -1) {
+      return a.localeCompare(b);
+    }
+    if (aIndex === -1) {
+      return 1;
+    }
+    if (bIndex === -1) {
+      return -1;
+    }
+    return aIndex - bIndex;
+  });
+  return {toolsWithAnnotations, categories, sortedCategories};
+}
+
+async function generateToolDocumentation(): Promise<void> {
+  try {
+    console.log('Generating tool documentation from definitions...');
+
+    {
+      const {toolsWithAnnotations, categories, sortedCategories} =
+        getToolsAndCategories(createTools({slim: false} as ParsedArguments));
+      await generateReference(
+        'Chrome DevTools MCP Tool Reference',
+        OUTPUT_PATH,
+        toolsWithAnnotations,
+        categories,
+        sortedCategories,
+        [],
+      );
+
+      // Generate tools TOC and update README
+      const toolsTOC = generateToolsTOC(categories, sortedCategories);
+      updateReadmeWithToolsTOC(toolsTOC);
     }
 
-    // Write the documentation to file
-    fs.writeFileSync(OUTPUT_PATH, markdown.trim() + '\n');
-
-    console.log(
-      `Generated documentation for ${toolsWithAnnotations.length} tools in ${OUTPUT_PATH}`,
-    );
-
-    // Generate tools TOC and update README
-    const toolsTOC = generateToolsTOC(categories, sortedCategories);
-    updateReadmeWithToolsTOC(toolsTOC);
+    {
+      const {toolsWithAnnotations, categories, sortedCategories} =
+        getToolsAndCategories(createTools({slim: true} as ParsedArguments));
+      await generateReference(
+        'Chrome DevTools MCP Slim Tool Reference',
+        SLIM_OUTPUT_PATH,
+        toolsWithAnnotations,
+        categories,
+        sortedCategories,
+        ['--slim'],
+      );
+    }
 
     // Generate and update configuration options
     const optionsMarkdown = generateConfigOptionsMarkdown();
     updateReadmeWithOptionsMarkdown(optionsMarkdown);
-    // Clean up
-    await client.close();
     process.exit(0);
   } catch (error) {
     console.error('Error generating documentation:', error);

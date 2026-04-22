@@ -3,28 +3,84 @@
  * Copyright 2025 Google LLC
  * SPDX-License-Identifier: Apache-2.0
  */
+
+import assert from 'node:assert';
+
+import type {CallToolResult} from '@modelcontextprotocol/sdk/types.js';
 import logger from 'debug';
 import type {Browser} from 'puppeteer';
-import puppeteer from 'puppeteer';
-import type {Frame, HTTPRequest, HTTPResponse} from 'puppeteer-core';
+import puppeteer, {Locator} from 'puppeteer';
+import type {
+  Frame,
+  HTTPRequest,
+  HTTPResponse,
+  LaunchOptions,
+  Page,
+} from 'puppeteer-core';
+import sinon from 'sinon';
 
+import type {ParsedArguments} from '../src/bin/chrome-devtools-mcp-cli-options.js';
 import {McpContext} from '../src/McpContext.js';
 import {McpResponse} from '../src/McpResponse.js';
 import {stableIdSymbol} from '../src/PageCollector.js';
+import {DevTools} from '../src/third_party/index.js';
 
-let browser: Browser | undefined;
+export function getTextContent(
+  content: CallToolResult['content'][number],
+): string {
+  if (content.type === 'text') {
+    return content.text;
+  }
+  throw new Error(`Expected text content but got ${content.type}`);
+}
+
+export function getImageContent(content: CallToolResult['content'][number]): {
+  data: string;
+  mimeType: string;
+} {
+  if (content.type === 'image') {
+    return {data: content.data, mimeType: content.mimeType};
+  }
+  throw new Error(`Expected image content but got ${content.type}`);
+}
+
+export function extractExtensionId(response: McpResponse) {
+  const responseLine = response.responseLines[0];
+  assert.ok(responseLine, 'Response should not be empty');
+  const match = responseLine.match(/Extension installed\. Id: (.+)/);
+  const extensionId = match ? match[1] : null;
+  assert.ok(extensionId, 'Response should contain a valid key');
+  return extensionId;
+}
+
+const browsers = new Map<string, Browser>();
+let context: McpContext | undefined;
 
 export async function withBrowser(
-  cb: (response: McpResponse, context: McpContext) => Promise<void>,
-  options: {debug?: boolean} = {},
+  cb: (browser: Browser, page: Page) => Promise<void>,
+  options: {
+    debug?: boolean;
+    autoOpenDevTools?: boolean;
+    executablePath?: string;
+  } = {},
 ) {
-  const {debug = false} = options;
+  const launchOptions: LaunchOptions = {
+    executablePath:
+      options.executablePath ?? process.env.PUPPETEER_EXECUTABLE_PATH,
+    headless: !options.debug,
+    defaultViewport: null,
+    devtools: options.autoOpenDevTools ?? false,
+    pipe: true,
+    handleDevToolsAsPage: true,
+    args: ['--screen-info={3840x2160}'],
+    enableExtensions: true,
+  };
+  const key = JSON.stringify(launchOptions);
+
+  let browser = browsers.get(key);
   if (!browser) {
-    browser = await puppeteer.launch({
-      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH,
-      headless: !debug,
-      defaultViewport: null,
-    });
+    browser = await puppeteer.launch(launchOptions);
+    browsers.set(key, browser);
   }
   const newPage = await browser.newPage();
   // Close other pages.
@@ -35,14 +91,44 @@ export async function withBrowser(
       }
     }),
   );
-  const response = new McpResponse();
-  const context = await McpContext.from(browser, logger('test'));
 
-  await cb(response, context);
+  await cb(browser, newPage);
+}
+
+export async function withMcpContext(
+  cb: (response: McpResponse, context: McpContext) => Promise<void>,
+  options: {
+    debug?: boolean;
+    autoOpenDevTools?: boolean;
+    performanceCrux?: boolean;
+    executablePath?: string;
+  } = {},
+  args: ParsedArguments = {} as ParsedArguments,
+) {
+  await withBrowser(async browser => {
+    const response = new McpResponse(args);
+    if (context) {
+      context.dispose();
+    }
+    context = await McpContext.from(
+      browser,
+      logger('test'),
+      {
+        experimentalDevToolsDebugging: false,
+        performanceCrux: options.performanceCrux ?? true,
+      },
+      Locator,
+    );
+
+    response.setPage(context.getSelectedMcpPage());
+
+    await cb(response, context);
+  }, options);
 }
 
 export function getMockRequest(
   options: {
+    url?: string;
     method?: string;
     response?: HTTPResponse;
     failure?: HTTPRequest['failure'];
@@ -53,11 +139,12 @@ export function getMockRequest(
     stableId?: number;
     navigationRequest?: boolean;
     frame?: Frame;
+    redirectChain?: HTTPRequest[];
   } = {},
 ): HTTPRequest {
   return {
     url() {
-      return 'http://example.com';
+      return options.url ?? 'http://example.com';
     },
     method() {
       return options.method ?? 'GET';
@@ -86,7 +173,7 @@ export function getMockRequest(
       };
     },
     redirectChain(): HTTPRequest[] {
-      return [];
+      return options.redirectChain ?? [];
     },
     isNavigationRequest() {
       return options.navigationRequest ?? false;
@@ -106,6 +193,9 @@ export function getMockResponse(
   return {
     status() {
       return options.status ?? 200;
+    },
+    headers(): Record<string, string> {
+      return {};
     },
   } as HTTPResponse;
 }
@@ -129,4 +219,115 @@ export function html(
     ${bodyContent}
   </body>
 </html>`;
+}
+
+export function stabilizeStructuredContent(content: unknown): unknown {
+  if (typeof content === 'string') {
+    return stabilizeResponseOutput(content);
+  }
+  if (Array.isArray(content)) {
+    return content.map(item => stabilizeStructuredContent(item));
+  }
+  if (typeof content === 'object' && content !== null) {
+    const result: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(content)) {
+      if (key === 'snapshotFilePath' && typeof value === 'string') {
+        result[key] = '<file>';
+      } else {
+        result[key] = stabilizeStructuredContent(value);
+      }
+    }
+    return result;
+  }
+  return content;
+}
+
+export function stabilizeResponseOutput(text: unknown) {
+  if (typeof text !== 'string') {
+    throw new Error('Input must be string');
+  }
+  let output = text;
+  const dateRegEx = /.{3}, \d{2} .{3} \d{4} \d{2}:\d{2}:\d{2} [A-Z]{3}/g;
+  output = output.replaceAll(dateRegEx, '<long date>');
+
+  const localhostRegEx = /localhost:\d{5}/g;
+  output = output.replaceAll(localhostRegEx, 'localhost:<port>');
+
+  const userAgentRegEx = /user-agent:.*\n/g;
+  output = output.replaceAll(userAgentRegEx, 'user-agent:<user-agent>\n');
+
+  const chUaRegEx = /sec-ch-ua:"Chromium";v="\d{3}"/g;
+  output = output.replaceAll(chUaRegEx, 'sec-ch-ua:"Chromium";v="<version>"');
+
+  // sec-ch-ua-platform:"Linux"
+  const chUaPlatformRegEx = /sec-ch-ua-platform:"[a-zA-Z]*"/g;
+  output = output.replaceAll(chUaPlatformRegEx, 'sec-ch-ua-platform:"<os>"');
+
+  const savedSnapshot = /Saved snapshot to (.*)/g;
+  output = output.replaceAll(savedSnapshot, 'Saved snapshot to <file>');
+
+  const acceptLanguageRegEx = /accept-language:.*\n/g;
+  output = output.replaceAll(acceptLanguageRegEx, 'accept-language:<lang>\n');
+
+  return output;
+}
+
+export function getMockAggregatedIssue(): sinon.SinonStubbedInstance<DevTools.AggregatedIssue> {
+  const mockAggregatedIssue = sinon.createStubInstance(
+    DevTools.AggregatedIssue,
+  );
+  mockAggregatedIssue.getAllIssues.returns([]);
+  return mockAggregatedIssue;
+}
+
+export function mockListener() {
+  const listeners: Record<string, Array<(data: unknown) => void>> = {};
+  return {
+    on(eventName: string, listener: (data: unknown) => void) {
+      if (listeners[eventName]) {
+        listeners[eventName].push(listener);
+      } else {
+        listeners[eventName] = [listener];
+      }
+    },
+    off(_eventName: string, _listener: (data: unknown) => void) {
+      // no-op
+    },
+    emit(eventName: string, data: unknown) {
+      for (const listener of listeners[eventName] ?? []) {
+        listener(data);
+      }
+    },
+  };
+}
+
+export function getMockPage(): Page {
+  const mainFrame = {} as Frame;
+  const cdpSession = {
+    ...mockListener(),
+    send: () => {
+      // no-op
+    },
+    target: () => ({_targetId: '<mock target ID>'}),
+  };
+  return {
+    mainFrame() {
+      return mainFrame;
+    },
+    ...mockListener(),
+    // @ts-expect-error internal API.
+    _client() {
+      return cdpSession;
+    },
+  } satisfies Page;
+}
+
+export function getMockBrowser(): Browser {
+  const pages = [getMockPage()];
+  return {
+    pages() {
+      return Promise.resolve(pages);
+    },
+    ...mockListener(),
+  } as Browser;
 }

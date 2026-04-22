@@ -3,6 +3,7 @@
  * Copyright 2025 Google LLC
  * SPDX-License-Identifier: Apache-2.0
  */
+
 import assert from 'node:assert';
 import {rm, stat, mkdir, chmod, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
@@ -11,16 +12,42 @@ import {describe, it} from 'node:test';
 
 import {screenshot} from '../../src/tools/screenshot.js';
 import {screenshots} from '../snapshot.js';
-import {html, withBrowser} from '../utils.js';
+import {html, withMcpContext} from '../utils.js';
 
 describe('screenshot', () => {
   describe('browser_take_screenshot', () => {
     it('with default options', async () => {
-      await withBrowser(async (response, context) => {
+      await withMcpContext(async (response, context) => {
         const fixture = screenshots.basic;
-        const page = context.getSelectedPage();
+        const page = context.getSelectedPptrPage();
         await page.setContent(fixture.html);
-        await screenshot.handler({params: {format: 'png'}}, response, context);
+        await screenshot.handler(
+          {params: {format: 'png'}, page: context.getSelectedMcpPage()},
+          response,
+          context,
+        );
+
+        assert.equal(response.images.length, 1);
+        assert.equal(response.images[0].mimeType, 'image/png');
+        assert.equal(
+          response.responseLines.at(0),
+          "Took a screenshot of the current page's viewport.",
+        );
+      });
+    });
+    it('ignores quality', async () => {
+      await withMcpContext(async (response, context) => {
+        const fixture = screenshots.basic;
+        const page = context.getSelectedPptrPage();
+        await page.setContent(fixture.html);
+        await screenshot.handler(
+          {
+            params: {format: 'png', quality: 0},
+            page: context.getSelectedMcpPage(),
+          },
+          response,
+          context,
+        );
 
         assert.equal(response.images.length, 1);
         assert.equal(response.images[0].mimeType, 'image/png');
@@ -31,8 +58,12 @@ describe('screenshot', () => {
       });
     });
     it('with jpeg', async () => {
-      await withBrowser(async (response, context) => {
-        await screenshot.handler({params: {format: 'jpeg'}}, response, context);
+      await withMcpContext(async (response, context) => {
+        await screenshot.handler(
+          {params: {format: 'jpeg'}, page: context.getSelectedMcpPage()},
+          response,
+          context,
+        );
 
         assert.equal(response.images.length, 1);
         assert.equal(response.images[0].mimeType, 'image/jpeg');
@@ -43,8 +74,12 @@ describe('screenshot', () => {
       });
     });
     it('with webp', async () => {
-      await withBrowser(async (response, context) => {
-        await screenshot.handler({params: {format: 'webp'}}, response, context);
+      await withMcpContext(async (response, context) => {
+        await screenshot.handler(
+          {params: {format: 'webp'}, page: context.getSelectedMcpPage()},
+          response,
+          context,
+        );
 
         assert.equal(response.images.length, 1);
         assert.equal(response.images[0].mimeType, 'image/webp');
@@ -55,12 +90,15 @@ describe('screenshot', () => {
       });
     });
     it('with full page', async () => {
-      await withBrowser(async (response, context) => {
+      await withMcpContext(async (response, context) => {
         const fixture = screenshots.viewportOverflow;
-        const page = context.getSelectedPage();
+        const page = context.getSelectedPptrPage();
         await page.setContent(fixture.html);
         await screenshot.handler(
-          {params: {format: 'png', fullPage: true}},
+          {
+            params: {format: 'png', fullPage: true},
+            page: context.getSelectedMcpPage(),
+          },
           response,
           context,
         );
@@ -75,8 +113,8 @@ describe('screenshot', () => {
     });
 
     it('with full page resulting in a large screenshot', async () => {
-      await withBrowser(async (response, context) => {
-        const page = context.getSelectedPage();
+      await withMcpContext(async (response, context) => {
+        const page = context.getSelectedPptrPage();
 
         await page.setContent(
           html`${`<div style="color:blue;">test</div>`.repeat(6500)}
@@ -92,7 +130,10 @@ describe('screenshot', () => {
         });
 
         await screenshot.handler(
-          {params: {format: 'png', fullPage: true}},
+          {
+            params: {format: 'png', fullPage: true},
+            page: context.getSelectedMcpPage(),
+          },
           response,
           context,
         );
@@ -109,18 +150,19 @@ describe('screenshot', () => {
     });
 
     it('with element uid', async () => {
-      await withBrowser(async (response, context) => {
+      await withMcpContext(async (response, context) => {
         const fixture = screenshots.button;
 
-        const page = context.getSelectedPage();
+        const page = context.getSelectedPptrPage();
         await page.setContent(fixture.html);
-        await context.createTextSnapshot();
+        await context.createTextSnapshot(context.getSelectedMcpPage());
         await screenshot.handler(
           {
             params: {
               format: 'png',
               uid: '1_1',
             },
+            page: context.getSelectedMcpPage(),
           },
           response,
           context,
@@ -136,14 +178,17 @@ describe('screenshot', () => {
     });
 
     it('with filePath', async () => {
-      await withBrowser(async (response, context) => {
+      await withMcpContext(async (response, context) => {
         const filePath = join(tmpdir(), 'test-screenshot.png');
         try {
           const fixture = screenshots.basic;
-          const page = context.getSelectedPage();
+          const page = context.getSelectedPptrPage();
           await page.setContent(fixture.html);
           await screenshot.handler(
-            {params: {format: 'png', filePath}},
+            {
+              params: {format: 'png', filePath},
+              page: context.getSelectedMcpPage(),
+            },
             response,
             context,
           );
@@ -178,13 +223,16 @@ describe('screenshot', () => {
         await chmod(filePath, 0o400);
 
         try {
-          await withBrowser(async (response, context) => {
+          await withMcpContext(async (response, context) => {
             const fixture = screenshots.basic;
-            const page = context.getSelectedPage();
+            const page = context.getSelectedPptrPage();
             await page.setContent(fixture.html);
             await assert.rejects(
               screenshot.handler(
-                {params: {format: 'png', filePath}},
+                {
+                  params: {format: 'png', filePath},
+                  page: context.getSelectedMcpPage(),
+                },
                 response,
                 context,
               ),
@@ -202,13 +250,16 @@ describe('screenshot', () => {
         const filePath = join(dir, 'test-screenshot.png');
 
         try {
-          await withBrowser(async (response, context) => {
+          await withMcpContext(async (response, context) => {
             const fixture = screenshots.basic;
-            const page = context.getSelectedPage();
+            const page = context.getSelectedPptrPage();
             await page.setContent(fixture.html);
             await assert.rejects(
               screenshot.handler(
-                {params: {format: 'png', filePath}},
+                {
+                  params: {format: 'png', filePath},
+                  page: context.getSelectedMcpPage(),
+                },
                 response,
                 context,
               ),
@@ -222,18 +273,21 @@ describe('screenshot', () => {
     });
 
     it('with malformed filePath', async () => {
-      await withBrowser(async (response, context) => {
+      await withMcpContext(async (response, context) => {
         // Use a platform-specific invalid character.
         // On Windows, characters like '<', '>', ':', '"', '/', '\', '|', '?', '*' are invalid.
         // On POSIX, the null byte is invalid.
         const invalidChar = process.platform === 'win32' ? '>' : '\0';
         const filePath = `malformed${invalidChar}path.png`;
         const fixture = screenshots.basic;
-        const page = context.getSelectedPage();
+        const page = context.getSelectedPptrPage();
         await page.setContent(fixture.html);
         await assert.rejects(
           screenshot.handler(
-            {params: {format: 'png', filePath}},
+            {
+              params: {format: 'png', filePath},
+              page: context.getSelectedMcpPage(),
+            },
             response,
             context,
           ),

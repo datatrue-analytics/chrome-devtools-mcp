@@ -3,56 +3,22 @@
  * Copyright 2025 Google LLC
  * SPDX-License-Identifier: Apache-2.0
  */
-import assert from 'node:assert';
-import {describe, it} from 'node:test';
 
-import type {Browser, Frame, HTTPRequest, Page, Target} from 'puppeteer-core';
+import assert from 'node:assert';
+import {afterEach, beforeEach, describe, it} from 'node:test';
+
+import type {Frame, HTTPRequest, Target, Protocol} from 'puppeteer-core';
+import sinon from 'sinon';
 
 import type {ListenerMap} from '../src/PageCollector.js';
-import {NetworkCollector, PageCollector} from '../src/PageCollector.js';
+import {
+  ConsoleCollector,
+  NetworkCollector,
+  PageCollector,
+} from '../src/PageCollector.js';
+import {DevTools} from '../src/third_party/index.js';
 
-import {getMockRequest} from './utils.js';
-
-function mockListener() {
-  const listeners: Record<string, Array<(data: unknown) => void>> = {};
-  return {
-    on(eventName: string, listener: (data: unknown) => void) {
-      if (listeners[eventName]) {
-        listeners[eventName].push(listener);
-      } else {
-        listeners[eventName] = [listener];
-      }
-    },
-    off(_eventName: string, _listener: (data: unknown) => void) {
-      // no-op
-    },
-    emit(eventName: string, data: unknown) {
-      for (const listener of listeners[eventName] ?? []) {
-        listener(data);
-      }
-    },
-  };
-}
-
-function getMockPage(): Page {
-  const mainFrame = {} as Frame;
-  return {
-    mainFrame() {
-      return mainFrame;
-    },
-    ...mockListener(),
-  } as Page;
-}
-
-function getMockBrowser(): Browser {
-  const pages = [getMockPage()];
-  return {
-    pages() {
-      return Promise.resolve(pages);
-    },
-    ...mockListener(),
-  } as Browser;
-}
+import {getMockRequest, getMockBrowser} from './utils.js';
 
 describe('PageCollector', () => {
   it('works', async () => {
@@ -66,7 +32,7 @@ describe('PageCollector', () => {
         },
       } as ListenerMap;
     });
-    await collector.init();
+    await collector.init([page]);
     page.emit('request', request);
 
     assert.equal(collector.getData(page)[0], request);
@@ -84,7 +50,7 @@ describe('PageCollector', () => {
         },
       } as ListenerMap;
     });
-    await collector.init();
+    await collector.init([page]);
     page.emit('request', request);
 
     assert.equal(collector.getData(page)[0], request);
@@ -104,7 +70,7 @@ describe('PageCollector', () => {
         },
       } as ListenerMap;
     });
-    await collector.init();
+    await collector.init([page]);
     page.emit('request', request);
     page.emit('framenavigated', {} as Frame);
 
@@ -123,7 +89,7 @@ describe('PageCollector', () => {
         },
       } as ListenerMap;
     });
-    await collector.init();
+    await collector.init([page]);
     page.emit('request', request);
 
     assert.equal(collector.getData(page)[0], request);
@@ -147,7 +113,7 @@ describe('PageCollector', () => {
         },
       } as ListenerMap;
     });
-    await collector.init();
+    await collector.init([page]);
     browser.emit('targetcreated', {
       page() {
         return Promise.resolve(page);
@@ -179,7 +145,7 @@ describe('PageCollector', () => {
         },
       } as ListenerMap;
     });
-    await collector.init();
+    await collector.init([page]);
 
     page.emit('request', request);
 
@@ -209,7 +175,7 @@ describe('PageCollector', () => {
         },
       } as ListenerMap;
     });
-    await collector.init();
+    await collector.init([page]);
 
     page.emit('request', request1);
     page.emit('request', request2);
@@ -233,7 +199,7 @@ describe('NetworkCollector', () => {
     });
     const request2 = getMockRequest();
     const collector = new NetworkCollector(browser);
-    await collector.init();
+    await collector.init([page]);
     page.emit('request', request);
     page.emit('request', navRequest);
 
@@ -249,5 +215,231 @@ describe('NetworkCollector', () => {
     assert.equal(collector.getData(page).length, 2);
     assert.equal(collector.getData(page)[0], navRequest);
     assert.equal(collector.getData(page)[1], request2);
+  });
+
+  it('correctly picks up after multiple back to back navigations', async () => {
+    const browser = getMockBrowser();
+    const page = (await browser.pages())[0];
+    const mainFrame = page.mainFrame();
+    const navRequest = getMockRequest({
+      navigationRequest: true,
+      frame: page.mainFrame(),
+    });
+    const navRequest2 = getMockRequest({
+      navigationRequest: true,
+      frame: page.mainFrame(),
+    });
+    const request = getMockRequest();
+
+    const collector = new NetworkCollector(browser);
+    await collector.init([page]);
+    page.emit('request', navRequest);
+    assert.equal(collector.getData(page)[0], navRequest);
+
+    page.emit('framenavigated', mainFrame);
+    assert.equal(collector.getData(page).length, 1);
+    assert.equal(collector.getData(page)[0], navRequest);
+
+    page.emit('request', navRequest2);
+    assert.equal(collector.getData(page).length, 2);
+    assert.equal(collector.getData(page)[0], navRequest);
+    assert.equal(collector.getData(page)[1], navRequest2);
+
+    page.emit('framenavigated', mainFrame);
+    assert.equal(collector.getData(page).length, 1);
+    assert.equal(collector.getData(page)[0], navRequest2);
+
+    page.emit('request', request);
+    assert.equal(collector.getData(page).length, 2);
+  });
+
+  it('works with previous navigations', async () => {
+    const browser = getMockBrowser();
+    const page = (await browser.pages())[0];
+    const mainFrame = page.mainFrame();
+    const navRequest = getMockRequest({
+      navigationRequest: true,
+      frame: page.mainFrame(),
+    });
+    const navRequest2 = getMockRequest({
+      navigationRequest: true,
+      frame: page.mainFrame(),
+    });
+    const request = getMockRequest();
+
+    const collector = new NetworkCollector(browser);
+    await collector.init([page]);
+    page.emit('request', navRequest);
+    assert.equal(collector.getData(page, true).length, 1);
+
+    page.emit('framenavigated', mainFrame);
+    assert.equal(collector.getData(page, true).length, 1);
+
+    page.emit('request', navRequest2);
+    assert.equal(collector.getData(page, true).length, 2);
+
+    page.emit('framenavigated', mainFrame);
+    assert.equal(collector.getData(page, true).length, 2);
+
+    page.emit('request', request);
+    assert.equal(collector.getData(page, true).length, 3);
+  });
+
+  it('should not grow beyond maxNavigationSaved', async () => {
+    const browser = getMockBrowser();
+    const page = (await browser.pages())[0];
+    const mainFrame = page.mainFrame();
+    const collector = new NetworkCollector(browser);
+    await collector.init([page]);
+
+    // Simulate 5 navigations (maxNavigationSaved is 3)
+    for (let i = 0; i < 5; i++) {
+      const req = getMockRequest({
+        url: `http://example.com/nav${i}`,
+        navigationRequest: true,
+        frame: mainFrame,
+      });
+      page.emit('request', req);
+      page.emit('framenavigated', mainFrame);
+    }
+
+    // We expect 3 arrays in navigations (current + 2 saved)
+    // Each navigation has 1 request, so total should be 3
+    assert.equal(collector.getData(page, true).length, 3);
+  });
+});
+
+describe('ConsoleCollector', () => {
+  let issue: Protocol.Audits.InspectorIssue;
+
+  beforeEach(() => {
+    issue = {
+      code: 'MixedContentIssue',
+      details: {
+        mixedContentIssueDetails: {
+          insecureURL: 'test.url',
+          resolutionStatus: 'MixedContentBlocked',
+          mainResourceURL: '',
+        },
+      },
+    };
+  });
+
+  afterEach(() => {
+    sinon.restore();
+  });
+
+  it('emits issues on page', async () => {
+    const browser = getMockBrowser();
+    const page = (await browser.pages())[0];
+    // @ts-expect-error internal API.
+    const cdpSession = page._client();
+    const onIssuesListener = sinon.spy();
+
+    page.on('issue', onIssuesListener);
+
+    const collector = new ConsoleCollector(browser, collect => {
+      return {
+        issue: issue => {
+          collect(issue as DevTools.AggregatedIssue);
+        },
+      } as ListenerMap;
+    });
+    await collector.init([page]);
+    cdpSession.emit('Audits.issueAdded', {issue});
+    sinon.assert.calledOnce(onIssuesListener);
+
+    const issueArgument = onIssuesListener.getCall(0).args[0];
+    assert(issueArgument instanceof DevTools.AggregatedIssue);
+  });
+
+  it('collects issues', async () => {
+    const browser = getMockBrowser();
+    const page = (await browser.pages())[0];
+    // @ts-expect-error internal API.
+    const cdpSession = page._client();
+
+    const collector = new ConsoleCollector(browser, collect => {
+      return {
+        issue: issue => {
+          collect(issue as DevTools.AggregatedIssue);
+        },
+      } as ListenerMap;
+    });
+    await collector.init([page]);
+
+    const issue2 = {
+      code: 'ElementAccessibilityIssue' as const,
+      details: {
+        elementAccessibilityIssueDetails: {
+          nodeId: 1,
+          elementAccessibilityIssueReason: 'DisallowedSelectChild',
+          hasDisallowedAttributes: true,
+        },
+      },
+    } satisfies Protocol.Audits.InspectorIssue;
+
+    cdpSession.emit('Audits.issueAdded', {issue});
+    cdpSession.emit('Audits.issueAdded', {issue: issue2});
+    const data = collector.getData(page);
+    assert.equal(data.length, 2);
+  });
+
+  it('filters duplicated issues', async () => {
+    const browser = getMockBrowser();
+    const page = (await browser.pages())[0];
+    // @ts-expect-error internal API.
+    const cdpSession = page._client();
+
+    const collector = new ConsoleCollector(browser, collect => {
+      return {
+        issue: issue => {
+          collect(issue as DevTools.AggregatedIssue);
+        },
+      } as ListenerMap;
+    });
+    await collector.init([page]);
+
+    cdpSession.emit('Audits.issueAdded', {issue});
+    cdpSession.emit('Audits.issueAdded', {issue});
+    const data = collector.getData(page);
+    assert.equal(data.length, 1);
+    const collectedIssue = data[0];
+    assert(collectedIssue instanceof DevTools.AggregatedIssue);
+    assert.equal(collectedIssue.code(), 'MixedContentIssue');
+    assert.equal(collectedIssue.getAggregatedIssuesCount(), 1);
+  });
+
+  it('emits UncaughtErrors for Runtime.exceptionThrown CDP events', async () => {
+    const browser = getMockBrowser();
+    const page = (await browser.pages())[0];
+    // @ts-expect-error internal API.
+    const cdpSession = page._client();
+    const onUncaughtErrorListener = sinon.spy();
+    const collector = new ConsoleCollector(browser, () => {
+      return {
+        uncaughtError: onUncaughtErrorListener,
+      } as ListenerMap;
+    });
+    await collector.init([page]);
+
+    cdpSession.emit('Runtime.exceptionThrown', {
+      exceptionDetails: {
+        exception: {description: 'SyntaxError: Expected {'},
+        text: 'Uncaught',
+        stackTrace: {callFrames: []},
+      },
+    });
+
+    sinon.assert.calledOnceWithMatch(
+      onUncaughtErrorListener,
+      sinon.match(e => {
+        return (
+          e.details.exception.description === 'SyntaxError: Expected {',
+          e.details.text === 'Uncaught',
+          e.details.stackTrace.callFrames.length === 0
+        );
+      }),
+    );
   });
 });

@@ -3,6 +3,7 @@
  * Copyright 2025 Google LLC
  * SPDX-License-Identifier: Apache-2.0
  */
+
 import http, {
   type IncomingMessage,
   type Server,
@@ -12,7 +13,7 @@ import {before, after, afterEach} from 'node:test';
 
 import {html} from './utils.js';
 
-class TestServer {
+export class TestServer {
   #port: number;
   #server: Server;
 

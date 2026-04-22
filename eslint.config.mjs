@@ -14,7 +14,12 @@ import tseslint from 'typescript-eslint';
 import localPlugin from './scripts/eslint_rules/local-plugin.js';
 
 export default defineConfig([
-  globalIgnores(['**/node_modules', '**/build/']),
+  globalIgnores([
+    '**/node_modules',
+    '**/build/',
+    'tests/tools/fixtures/',
+    'src/third_party/lighthouse-devtools-mcp-bundle.js',
+  ]),
   importPlugin.flatConfigs.typescript,
   {
     languageOptions: {
@@ -29,8 +34,10 @@ export default defineConfig([
         projectService: {
           allowDefaultProject: [
             '.prettierrc.cjs',
+            'puppeteer.config.cjs',
             'eslint.config.mjs',
             'rollup.config.mjs',
+            'skills/memory-leak-debugging/references/compare_snapshots.js',
           ],
         },
       },
@@ -59,6 +66,7 @@ export default defineConfig([
     name: 'TypeScript rules',
     rules: {
       '@local/check-license': 'error',
+      curly: ['error', 'all'],
 
       'no-undef': 'off',
       'no-unused-vars': 'off',
@@ -112,6 +120,19 @@ export default defineConfig([
 
       '@stylistic/function-call-spacing': 'error',
       '@stylistic/semi': 'error',
+
+      'no-restricted-imports': [
+        'error',
+        {
+          patterns: [
+            {
+              regex: '.*chrome-devtools-frontend/(?!mcp/mcp.js$).*',
+              message:
+                'Import only the devtools-frontend code exported via node_modules/chrome-devtools-frontend/mcp/mcp.js',
+            },
+          ],
+        },
+      ],
     },
   },
   {
